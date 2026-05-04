@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: tweetshot <tweet-url> [--frames N] [--out DIR] [--thread] [--transcribe] [--analyze-prompt]
+
+Fetch a tweet/X post with bird, download media, extract representative frames,
+and emit one LLM-ready JSON blob. Uses browser cookies through bird; no X API key.
+
+Options:
+  --frames N         Target frame count per video. Default: 8
+  --out DIR          Output base directory. Default: $TMPDIR/tweetshot
+  --thread           Use bird thread --json instead of bird read --json
+  --transcribe       Optional Whisper transcript. Needs whisper-cli and WHISPER_MODEL
+  --analyze-prompt   Write analysis_prompt.md beside the media and include its path in JSON
+USAGE
+}
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 2
+fi
+
+URL="$1"
+FRAMES=8
+OUT_BASE="${TMPDIR:-/tmp}/tweetshot"
+TRANSCRIBE=0
+THREAD=0
+ANALYZE_PROMPT=0
+shift || true
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --frames)
+      [[ $# -ge 2 ]] || { echo "--frames needs a value" >&2; exit 2; }
+      FRAMES="$2"; shift 2 ;;
+    --out)
+      [[ $# -ge 2 ]] || { echo "--out needs a value" >&2; exit 2; }
+      OUT_BASE="$2"; shift 2 ;;
+    --transcribe)
+      TRANSCRIBE=1; shift ;;
+    --thread)
+      THREAD=1; shift ;;
+    --analyze-prompt)
+      ANALYZE_PROMPT=1; shift ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      echo "unknown flag: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+for cmd in bird jq curl ffmpeg ffprobe awk grep shasum find sort; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "missing dependency: $cmd" >&2; exit 3; }
+done
+
+if [[ "$TRANSCRIBE" -eq 1 ]]; then
+  command -v whisper-cli >/dev/null 2>&1 || { echo "missing dependency: whisper-cli (brew install whisper-cpp)" >&2; exit 3; }
+  [[ -n "${WHISPER_MODEL:-}" ]] || { echo "set WHISPER_MODEL=/path/to/ggml-model.bin" >&2; exit 3; }
+fi
+
+TWEET_ID="$(printf '%s\n' "$URL" | grep -oE 'status/[0-9]+' | tail -1 | cut -d/ -f2 || true)"
+if [[ -z "$TWEET_ID" ]]; then
+  TWEET_ID="$(printf '%s' "$URL" | shasum | awk '{print $1}')"
+fi
+
+OUT="$OUT_BASE/$TWEET_ID"
+mkdir -p "$OUT"
+TWEET_JSON="$OUT/tweet.json"
+
+if [[ "$THREAD" -eq 1 ]]; then
+  bird thread --json "$URL" > "$TWEET_JSON"
+else
+  bird read --json "$URL" > "$TWEET_JSON"
+fi
+
+MEDIA_QUERY='
+  def first_nonempty(xs): xs | map(select(. != null and . != "")) | .[0];
+  [.. | objects | select((.type? == "photo") or (.type? == "video") or (.type? == "animated_gif") or (.type? == "gif"))]
+  | unique_by(.url // .media_url_https // .videoUrl // .expanded_url // tostring)
+  | map({
+      type: (.type // "unknown"),
+      image_url: first_nonempty([.url, .media_url_https, .mediaUrlHttps]),
+      video_url: first_nonempty([.videoUrl, .video_url, .expanded_url, (.video_info.variants // [] | map(select(.content_type == "video/mp4") | .url) | sort_by(length) | last)]),
+      raw: .
+    })'
+
+MEDIA_ITEMS="$OUT/media_items.json"
+jq "$MEDIA_QUERY" "$TWEET_JSON" > "$MEDIA_ITEMS"
+MEDIA_OUTPUT='[]'
+INDEX=0
+
+while IFS= read -r MEDIA; do
+  TYPE="$(printf '%s' "$MEDIA" | jq -r '.type // "unknown"')"
+  IMAGE_URL="$(printf '%s' "$MEDIA" | jq -r '.image_url // empty')"
+  VIDEO_URL="$(printf '%s' "$MEDIA" | jq -r '.video_url // empty')"
+
+  case "$TYPE" in
+    photo)
+      [[ -n "$IMAGE_URL" ]] || continue
+      IMG_PATH="$OUT/img_${INDEX}.jpg"
+      curl -fsSL "$IMAGE_URL" -o "$IMG_PATH"
+      MEDIA_OUTPUT="$(jq --arg p "$IMG_PATH" --arg src "$IMAGE_URL" '. += [{"type":"image","path":$p,"source_url":$src,"frames":[]}]' <<< "$MEDIA_OUTPUT")"
+      ;;
+    video|animated_gif|gif)
+      [[ -n "$VIDEO_URL" ]] || continue
+      VIDEO_PATH="$OUT/video_${INDEX}.mp4"
+      curl -fsSL "$VIDEO_URL" -o "$VIDEO_PATH"
+
+      FRAME_DIR="$OUT/frames_${INDEX}"
+      mkdir -p "$FRAME_DIR"
+      DURATION="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$VIDEO_PATH" 2>/dev/null || printf '0')"
+      FPS_DENOM="$(awk -v d="$DURATION" -v n="$FRAMES" 'BEGIN { if (n < 1) n=1; v=int(d/n); if (v < 1) v=1; printf "%d", v }')"
+      ffmpeg -loglevel error -y -i "$VIDEO_PATH" -vf "fps=1/$FPS_DENOM" "$FRAME_DIR/frame_%02d.jpg"
+      FRAMES_JSON="$(find "$FRAME_DIR" -maxdepth 1 -name 'frame_*.jpg' | sort | jq -Rs 'split("\n") | map(select(length > 0))')"
+
+      TRANSCRIPT_JSON='null'
+      if [[ "$TRANSCRIBE" -eq 1 ]]; then
+        AUDIO="$OUT/audio_${INDEX}.wav"
+        ffmpeg -loglevel error -y -i "$VIDEO_PATH" -ar 16000 -ac 1 -vn "$AUDIO"
+        whisper-cli -m "$WHISPER_MODEL" -ojf -f "$AUDIO" -of "${AUDIO%.wav}" >/dev/null 2>&1
+        TRANSCRIPT_JSON="$(cat "${AUDIO%.wav}.json" 2>/dev/null || echo null)"
+      fi
+
+      MEDIA_OUTPUT="$(jq \
+        --arg t "$TYPE" \
+        --arg p "$VIDEO_PATH" \
+        --arg src "$VIDEO_URL" \
+        --arg d "$DURATION" \
+        --argjson f "$FRAMES_JSON" \
+        --argjson tr "$TRANSCRIPT_JSON" \
+        '. += [{"type":$t,"path":$p,"source_url":$src,"frames":$f,"duration_sec":($d|tonumber? // 0),"transcript":$tr}]' <<< "$MEDIA_OUTPUT")"
+      ;;
+  esac
+  INDEX=$((INDEX + 1))
+done < <(jq -c '.[]' "$MEDIA_ITEMS")
+
+ANALYSIS_PROMPT_PATH=""
+if [[ "$ANALYZE_PROMPT" -eq 1 ]]; then
+  ANALYSIS_PROMPT_PATH="$OUT/analysis_prompt.md"
+  {
+    echo "# Tweetshot Media Analysis Prompt"
+    echo
+    echo "Analyze this tweet and its extracted media frames. Be specific and visual. Do not infer beyond the frames unless you mark it as uncertainty."
+    echo
+    echo "## Questions"
+    echo
+    echo "1. What is shown in the media?"
+    echo "2. What changes over time across the frames?"
+    echo "3. What product, UI, game, or workflow patterns are visible?"
+    echo "4. What should a builder copy, avoid, or test next?"
+    echo "5. Give a concise implementation-relevant summary."
+    echo
+    echo "## Tweet JSON"
+    jq '{id:(.id // .id_str), author:(.author // .user), text:(.text // .full_text // .legacy.full_text), created_at:(.createdAt // .created_at // .legacy.created_at)}' "$TWEET_JSON"
+    echo
+    echo "## Media Frames"
+    jq -r '.[] | if (.frames | length) > 0 then .frames[] else .path end' <<< "$MEDIA_OUTPUT"
+  } > "$ANALYSIS_PROMPT_PATH"
+fi
+
+OUT="$OUT" jq \
+  --argjson media "$MEDIA_OUTPUT" \
+  --arg source "$URL" \
+  --arg analysis_prompt "$ANALYSIS_PROMPT_PATH" '
+  {
+    tweet_id: (.id // .id_str // null),
+    author: (.author // .user // .core.user_results.result.legacy.screen_name // null),
+    text: (.text // .full_text // .legacy.full_text // null),
+    posted_at: (.createdAt // .created_at // .legacy.created_at // null),
+    stats: (.stats // .public_metrics // .legacy | objects // {}),
+    media: $media,
+    media_count: ($media | length),
+    analysis_prompt: (if $analysis_prompt == "" then null else $analysis_prompt end),
+    source_url: $source,
+    output_dir: env.OUT
+  }' "$TWEET_JSON"
