@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'USAGE'
-usage: tweetshot <tweet-url> [--frames N] [--out DIR] [--thread] [--transcribe] [--analyze-prompt]
+usage: tweetshot <tweet-url> [--frames N] [--out DIR] [--thread] [--transcribe] [--analyze-prompt] [--analyze] [--model MODEL]
 
 Fetch a tweet/X post with bird, download media, extract representative frames,
 and emit one LLM-ready JSON blob. Uses browser cookies through bird; no X API key.
@@ -14,6 +14,8 @@ Options:
   --thread           Use bird thread --json instead of bird read --json
   --transcribe       Optional Whisper transcript. Needs whisper-cli and WHISPER_MODEL
   --analyze-prompt   Write analysis_prompt.md beside the media and include its path in JSON
+  --analyze          Call OpenAI Responses API on extracted frames. Needs OPENAI_API_KEY
+  --model MODEL      Model for --analyze. Default: gpt-4.1-mini
 USAGE
 }
 
@@ -28,6 +30,8 @@ OUT_BASE="${TMPDIR:-/tmp}/tweetshot"
 TRANSCRIBE=0
 THREAD=0
 ANALYZE_PROMPT=0
+ANALYZE=0
+MODEL="gpt-4.1-mini"
 shift || true
 
 while [[ $# -gt 0 ]]; do
@@ -44,6 +48,11 @@ while [[ $# -gt 0 ]]; do
       THREAD=1; shift ;;
     --analyze-prompt)
       ANALYZE_PROMPT=1; shift ;;
+    --analyze)
+      ANALYZE=1; ANALYZE_PROMPT=1; shift ;;
+    --model)
+      [[ $# -ge 2 ]] || { echo "--model needs a value" >&2; exit 2; }
+      MODEL="$2"; shift 2 ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -58,6 +67,11 @@ done
 if [[ "$TRANSCRIBE" -eq 1 ]]; then
   command -v whisper-cli >/dev/null 2>&1 || { echo "missing dependency: whisper-cli (brew install whisper-cpp)" >&2; exit 3; }
   [[ -n "${WHISPER_MODEL:-}" ]] || { echo "set WHISPER_MODEL=/path/to/ggml-model.bin" >&2; exit 3; }
+fi
+
+if [[ "$ANALYZE" -eq 1 ]]; then
+  command -v base64 >/dev/null 2>&1 || { echo "missing dependency: base64" >&2; exit 3; }
+  [[ -n "${OPENAI_API_KEY:-}" ]] || { echo "set OPENAI_API_KEY for --analyze" >&2; exit 3; }
 fi
 
 TWEET_ID="$(printf '%s\n' "$URL" | grep -oE 'status/[0-9]+' | tail -1 | cut -d/ -f2 || true)"
@@ -160,10 +174,42 @@ if [[ "$ANALYZE_PROMPT" -eq 1 ]]; then
   } > "$ANALYSIS_PROMPT_PATH"
 fi
 
+ANALYSIS_PATH=""
+if [[ "$ANALYZE" -eq 1 ]]; then
+  ANALYSIS_PATH="$OUT/analysis.md"
+  ANALYSIS_INPUT="$OUT/analysis_request.json"
+  CONTENT_JSON='[]'
+  PROMPT_TEXT="$(cat "$ANALYSIS_PROMPT_PATH")"
+  CONTENT_JSON="$(jq --arg text "$PROMPT_TEXT" '. += [{"type":"input_text","text":$text}]' <<< "$CONTENT_JSON")"
+
+  while IFS= read -r MEDIA_PATH; do
+    [[ -f "$MEDIA_PATH" ]] || continue
+    case "$MEDIA_PATH" in
+      *.png) MIME="image/png" ;;
+      *.webp) MIME="image/webp" ;;
+      *) MIME="image/jpeg" ;;
+    esac
+    B64="$(base64 < "$MEDIA_PATH" | tr -d '\n')"
+    CONTENT_JSON="$(jq --arg url "data:$MIME;base64,$B64" '. += [{"type":"input_image","image_url":$url}]' <<< "$CONTENT_JSON")"
+  done < <(jq -r '.[] | if (.frames | length) > 0 then .frames[] else .path end' <<< "$MEDIA_OUTPUT")
+
+  jq -n --arg model "$MODEL" --argjson content "$CONTENT_JSON" \
+    '{model:$model,input:[{role:"user",content:$content}]}' > "$ANALYSIS_INPUT"
+
+  curl -fsS https://api.openai.com/v1/responses \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d @"$ANALYSIS_INPUT" \
+    | tee "$OUT/analysis_response.json" \
+    | jq -r '.output_text // ([.output[]?.content[]? | select(.type == "output_text") | .text] | join("\n"))' \
+    > "$ANALYSIS_PATH"
+fi
+
 OUT="$OUT" jq \
   --argjson media "$MEDIA_OUTPUT" \
   --arg source "$URL" \
-  --arg analysis_prompt "$ANALYSIS_PROMPT_PATH" '
+  --arg analysis_prompt "$ANALYSIS_PROMPT_PATH" \
+  --arg analysis "$ANALYSIS_PATH" '
   {
     tweet_id: (.id // .id_str // null),
     author: (.author // .user // .core.user_results.result.legacy.screen_name // null),
@@ -173,6 +219,7 @@ OUT="$OUT" jq \
     media: $media,
     media_count: ($media | length),
     analysis_prompt: (if $analysis_prompt == "" then null else $analysis_prompt end),
+    analysis: (if $analysis == "" then null else $analysis end),
     source_url: $source,
     output_dir: env.OUT
   }' "$TWEET_JSON"

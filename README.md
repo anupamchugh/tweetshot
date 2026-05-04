@@ -2,7 +2,7 @@
 
 `bird + ffmpeg + jq` in one CLI for tweet/X media analysis.
 
-`tweetshot` fetches tweet text and media without a paid X API key, downloads the media, extracts representative video frames, and emits a JSON blob plus an optional analysis prompt for multimodal LLMs.
+`tweetshot` fetches tweet text and media without a paid X API key, downloads the media, extracts representative video frames, and emits a JSON blob plus an optional analysis prompt or OpenAI-powered media analysis.
 
 ## What it does
 
@@ -14,9 +14,10 @@ tweet URL
 -> ffmpeg frame extraction
 -> JSON output
 -> optional analysis_prompt.md
+-> optional analysis.md from OpenAI
 ```
 
-It prepares media for inference. It does not call GPT/Claude by default.
+By default it prepares media for inference. With `--analyze`, it calls OpenAI's Responses API and writes `analysis.md`.
 
 ## Install
 
@@ -31,6 +32,7 @@ chmod +x ~/bin/tweetshot
 
 ```bash
 tweetshot "https://x.com/DannyLimanseta/status/2040791667868070273" --frames 8 --analyze-prompt
+tweetshot "https://x.com/DannyLimanseta/status/2040791667868070273" --frames 8 --analyze
 ```
 
 Output shape:
@@ -41,6 +43,7 @@ Output shape:
   "author": { "username": "DannyLimanseta", "name": "Danny Limanseta" },
   "text": "...",
   "media_count": 1,
+  "analysis": "/tmp/tweetshot/.../analysis.md",
   "media": [
     {
       "type": "video",
@@ -63,6 +66,8 @@ Output shape:
 --thread           Use bird thread --json
 --transcribe       Optional Whisper transcript. Needs whisper-cli and WHISPER_MODEL
 --analyze-prompt   Write analysis_prompt.md beside the media
+--analyze          Call OpenAI on extracted frames. Needs OPENAI_API_KEY
+--model MODEL      Model for --analyze. Default: gpt-4.1-mini
 ```
 
 ## Why not just use media-mcp?
