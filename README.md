@@ -31,16 +31,16 @@ chmod +x ~/bin/tweetshot
 ## Usage
 
 ```bash
-tweetshot "https://x.com/DannyLimanseta/status/2040791667868070273" --frames 8 --analyze-prompt
-tweetshot "https://x.com/DannyLimanseta/status/2040791667868070273" --frames 8 --analyze
+tweetshot "https://x.com/example/status/1234567890" --frames 8 --analyze-prompt
+tweetshot "https://x.com/example/status/1234567890" --frames 8 --analyze
 ```
 
 Output shape:
 
 ```json
 {
-  "tweet_id": "2040791667868070273",
-  "author": { "username": "DannyLimanseta", "name": "Danny Limanseta" },
+  "tweet_id": "1234567890",
+  "author": { "username": "example", "name": "Example User" },
   "text": "...",
   "media_count": 1,
   "analysis": "/tmp/tweetshot/.../analysis.md",
